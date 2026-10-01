@@ -1529,7 +1529,11 @@ fn load_projects_in(id: &ProfileId) -> Vec<Project> {
         p.profile = id.clone();
     }
     if dirty {
-        let _ = save_projects_in(id, &list);
+        // Write back to `f` — the file just read — rather than re-resolving
+        // it. `TERMIC_DATA_DIR` is process-global and a test's scratch window
+        // can flip it between the two resolutions, landing this write in a
+        // directory the records were never read from.
+        let _ = save_projects_at(&f, &list);
     }
     list
 }
@@ -1760,8 +1764,12 @@ fn project_path_taken(list: &[Project], profile: &ProfileId, canon: &str) -> boo
 }
 
 fn save_projects_in(id: &ProfileId, list: &[Project]) -> Result<()> {
+    save_projects_at(&projects_file_in(id)?, list)
+}
+
+fn save_projects_at(f: &Path, list: &[Project]) -> Result<()> {
     let json = serde_json::to_string_pretty(list)?;
-    write_atomic(&projects_file_in(id)?, json.as_bytes())?;
+    write_atomic(f, json.as_bytes())?;
     Ok(())
 }
 
@@ -22177,7 +22185,14 @@ pub(crate) fn load_settings_in(id: &ProfileId) -> Settings {
         // had its settings written over the root profile on every load (the
         // root's accounts and paths went with them), and never received the
         // migration itself, so the next load did it again.
-        let _ = save_settings_in(id, &s);
+        //
+        // `f`, not a re-resolution through `save_settings_in`: `TERMIC_DATA_DIR`
+        // is process-global, and a test's scratch window can flip it between the
+        // read and this write — re-resolving would land the migrated copy in a
+        // settings.json the load never read from (clobbering that scratch's
+        // file — observed as an intermittent `agent_hooks` test failure — or,
+        // flipped the other way, in the developer's real data dir).
+        let _ = save_settings_at(&f, &s);
     }
     s
 }
@@ -22667,8 +22682,12 @@ fn settings_save(app: AppHandle, window: tauri::Window, s: Settings) -> Result<(
 /// Settings UI does, instead of growing a second encoder that could drift.
 pub(crate) fn save_settings_in(id: &ProfileId, s: &Settings) -> Result<(), String> {
     let f = settings_file_in(id).map_err(|e| e.to_string())?;
+    save_settings_at(&f, s)
+}
+
+fn save_settings_at(f: &Path, s: &Settings) -> Result<(), String> {
     let json = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
-    write_atomic(&f, json.as_bytes()).map_err(|e| e.to_string())
+    write_atomic(f, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// The ROOT profile's settings writer. Mirror of [`load_settings_inner`].
