@@ -1,3 +1,4 @@
+import { sendDeliveryMessage } from "@/lib/deliverySend";
 // Single terminal tab: spawns a PTY on first mount, attaches xterm.js, owns
 // the resize/refit dance and the attention/unread heuristics. Stays mounted
 // across tab switches (parent toggles visibility) so we don't reconnect PTYs.
@@ -838,7 +839,9 @@ const captureArmedRef = useRef(false);
       if (cur.workState === "working") {
         useApp.getState().setWorkState(task.id, tab.id, "idle", "scheduled send pending");
       }
-      void deliverScheduled(ptyId, head.id, force);
+      // Keep the promise: a flush awaiting "the write in flight" must wait on
+      // THIS send, not whatever promise the ref held from an earlier item.
+      lastDeliveryRef.current = deliverScheduled(ptyId, head.id, force);
       return true;
     }
     // Rate limit the automatic loop: if the floor hasn't elapsed since the last
@@ -865,6 +868,24 @@ const captureArmedRef = useRef(false);
           return true;
         }
       }
+    }
+    if (head.delivery) {
+      // scheduledInFlightRef also serializes delivery sends: one write at a
+      // time regardless of which queue-item kind owns the turn.
+      if (scheduledInFlightRef.current) return true;
+      scheduledInFlightRef.current = head.id;
+      lastDeliveryRef.current = sendDeliveryMessage(task.id, tab.id, head).then(sent => {
+        const now = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id);
+        if (now?.type !== "terminal") return;
+        if (sent) {
+          lastQueueSendAtRef.current = Date.now();
+          queuedTurnPendingRef.current = true;
+          patchTab(task.id, tab.id, { queue: (now.queue ?? []).filter(item => item.id !== head.id) });
+        } else {
+          patchTab(task.id, tab.id, { queueActive: false });
+        }
+      }).finally(() => { scheduledInFlightRef.current = null; });
+      return true;
     }
     if (head.promptId) {
       // CLI-queued prompt (`termic send` to a busy agent): the server's

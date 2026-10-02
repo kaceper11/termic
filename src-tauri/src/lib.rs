@@ -45,6 +45,7 @@ mod shell_env;
 mod automation;
 mod cli_server;
 mod forge;
+mod delivery;
 mod mcp_server;
 // Row shapes + OS-agnostic logic (subtree walk, cpu_ratio, label_for,
 // signal_from_name) shared by every `procmon` variant below.
@@ -864,6 +865,9 @@ pub struct TaskMember {
     /// creation copied in.
     #[serde(default)]
     pub files_to_copy: Vec<String>,
+    pub pr_url: Option<String>,
+    pub pr_number: Option<u64>,
+    pub pr_provider: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2610,8 +2614,24 @@ fn fetch_ref(repo: &Path, remote_ref: &str) -> std::result::Result<(), String> {
 /// fetch argument — a bare refname (via the remote's configured refspec) or
 /// a full `src:dst` refspec; `desc` names the op in error strings.
 fn guarded_fetch(repo: &Path, remote: &str, spec: &str, desc: &str) -> std::result::Result<(), String> {
+    guarded_git(repo, &["fetch", "--no-tags", remote, spec], desc, 15)
+}
+
+/// `git push` with the same no-prompt/deadline treatment as guarded_fetch:
+/// an SSH passphrase prompt or a wedged remote would otherwise block the
+/// calling thread forever.
+fn guarded_push(repo: &Path, args: &[&str]) -> std::result::Result<(), String> {
+    guarded_git(repo, args, "push", 120)
+}
+
+fn guarded_git(
+    repo: &Path,
+    args: &[&str],
+    desc: &str,
+    timeout_secs: u64,
+) -> std::result::Result<(), String> {
     let mut cmd = git_command();
-    cmd.args(["fetch", "--no-tags", remote, spec]).current_dir(repo);
+    cmd.args(args).current_dir(repo);
     // Same login-shell env as git() so credential helpers / SSH config resolve
     // from a GUI-launched .app (bare launchd PATH otherwise).
     let (path, inject) = shell_env::spawn_env();
@@ -2645,10 +2665,9 @@ fn guarded_fetch(repo: &Path, remote: &str, spec: &str, desc: &str) -> std::resu
         h.and_then(|h| h.join().ok()).unwrap_or_default().trim().to_string()
     };
 
-    // Poll to a hard deadline; SIGKILL on expiry. 15s covers a normal
-    // single-ref fetch on a slow link; ConnectTimeout=10 already caps the
-    // common dead-host case well under this.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    // Poll to a hard deadline; SIGKILL on expiry. ConnectTimeout=10 already
+    // caps the common dead-host case well under the caller's timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -6033,6 +6052,9 @@ fn link_repo_mode_members(host_dir: &Path, members: &[ProjectMember], first_port
         let member_port = next_member_port;
         next_member_port = next_member_port.saturating_add(1);
         composition.push(TaskMember {
+            pr_url: None,
+            pr_number: None,
+            pr_provider: None,
             project_id: String::new(),
             repo_path: pm.root_path.clone(),
             dir_name,
@@ -7740,6 +7762,9 @@ fn materialize_member(
             // clobber a file with its own stale copy at worst. The list
             // is still frozen so a later mode change reads the same one.
             Ok(TaskMember {
+                pr_url: None,
+                pr_number: None,
+                pr_provider: None,
                 project_id: String::new(),
                 repo_path: mp.root_path.clone(),
                 dir_name: dir_name.to_string(),
@@ -7801,6 +7826,9 @@ fn materialize_member(
                 }
             }
             Ok(TaskMember {
+                pr_url: None,
+                pr_number: None,
+                pr_provider: None,
                 project_id: String::new(),
                 repo_path: mp.root_path.clone(),
                 dir_name: dir_name.to_string(),
@@ -12097,7 +12125,7 @@ enum UpdateMode {
     Rebase,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct UpdateResult {
     branch: String,
     /// What we updated FROM: the branch's own upstream for Pull, the task's
@@ -13450,7 +13478,11 @@ fn pr_lookup_at(
     let by_branch = forge::pr_status(provider, cwd, None);
     let resolved = match by_branch {
         Ok(Some(pr)) => Ok(Some(pr)),
-        Ok(None) if known_number.is_some() => forge::pr_status(provider, cwd, known_number),
+        Ok(None) if known_number.is_some() => {
+            let branch = git(&["branch", "--show-current"], cwd).unwrap_or_default();
+            forge::pr_status(provider, cwd, known_number)
+                .map(|pr| pr.filter(|p| !branch.trim().is_empty() && p.head == branch.trim()))
+        },
         other => other,
     };
     match resolved {
@@ -13526,7 +13558,8 @@ pub struct MemberPrLookup {
 
 fn member_pr_lookups(id: &str) -> Result<Vec<MemberPrLookup>, String> {
     let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
-    Ok(on_disk_members(&w)
+    let rows: Vec<MemberPrLookup> = w.composition
+        .iter()
         .map(|m| {
             let cwd = Path::new(&m.path);
             // Frozen `m.branch` is the create-time value; read HEAD like
@@ -13541,10 +13574,49 @@ fn member_pr_lookups(id: &str) -> Result<Vec<MemberPrLookup>, String> {
             MemberPrLookup {
                 dir_name: m.dir_name.clone(),
                 branch,
-                lookup: pr_lookup_at(cwd, None, None),
+                lookup: if !cwd.is_dir() {
+                    PrLookup {
+                        provider: None,
+                        remote_url: String::new(),
+                        status: "checkout-missing".into(),
+                        message: "Repository checkout is missing".into(),
+                        pr: None,
+                    }
+                } else {
+                    // Persisted identity as the by-number fallback — same
+                    // contract the host card's pr_lookup_at has.
+                    pr_lookup_at(cwd, m.pr_number, m.pr_provider.as_deref())
+                },
             }
         })
-        .collect())
+        .collect();
+    // Persist the identity discovered by-branch so later lookups and the
+    // delivery panel's selectors can fall back to it. Reload the task first:
+    // composition may have been edited since `w` was read at the top.
+    let mut latest = load_tasks_all().into_iter().find(|t| t.id == id).ok_or("no task")?;
+    let mut changed = false;
+    for row in &rows {
+        let Some(pr) = &row.lookup.pr else { continue };
+        let Some(member) = latest.composition.iter_mut().find(|m| {
+            m.dir_name == row.dir_name
+                && w.composition.iter().any(|old| old.dir_name == m.dir_name && old.path == m.path)
+        }) else {
+            continue;
+        };
+        if member.pr_number != Some(pr.number)
+            || member.pr_provider.as_deref() != Some(pr.provider.as_str())
+            || member.pr_url.as_deref() != Some(pr.url.as_str())
+        {
+            member.pr_number = Some(pr.number);
+            member.pr_provider = Some(pr.provider.clone());
+            member.pr_url = Some(pr.url.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        save_task(&latest).map_err(|e| e.to_string())?;
+    }
+    Ok(rows)
 }
 
 /// One issue-list round-trip: provider resolution + the open issues, or
@@ -13963,7 +14035,7 @@ fn task_set_pr_comments_seen(id: String, iso: String) -> Result<(), String> {
 /// set-upstream behaviour cannot differ between "Commit and Push" and pushing
 /// what is already committed.
 fn git_push(cwd: &Path) -> Result<(), String> {
-    if git(&["push"], cwd).is_ok() {
+    if guarded_push(cwd, &["push"]).is_ok() {
         return Ok(());
     }
     let remote = detect_default_remote(cwd);
@@ -13974,7 +14046,7 @@ fn git_push(cwd: &Path) -> Result<(), String> {
     if branch.is_empty() {
         return Err("cannot push: detached HEAD".to_string());
     }
-    git(&["push", "-u", &remote, &branch], cwd).map_err(|e| e.to_string())?;
+    guarded_push(cwd, &["push", "-u", &remote, &branch])?;
     Ok(())
 }
 
@@ -19864,6 +19936,21 @@ fn open_path(path: String) -> Result<(), String> {
 /// copies of three lines is exactly the kind of thing a later refactor edits
 /// one of. Now they cannot disagree.
 fn spawn_os_open(target: &str) -> Result<(), String> {
+    // A `scheme:` target goes to the OS's registered handler, which for
+    // file:/smb:/javascript: is something other than "the browser". Only
+    // schemes with a known safe handler are URL-shaped input (forge pages,
+    // docs, the Support mailto:); absolute paths — the other legitimate
+    // input — have no scheme. Two+ chars before the colon so a Windows
+    // drive letter (C:\) is not mistaken for a scheme.
+    if let Some(scheme) = target
+        .split_once(':')
+        .map(|(s, _)| s)
+        .filter(|s| s.len() > 1 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) && s.starts_with(|c: char| c.is_ascii_alphabetic()))
+    {
+        if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https" | "mailto") {
+            return Err(format!("refusing to open '{scheme}:…' — not a web link"));
+        }
+    }
     let (program, args) = open_command(std::env::consts::OS, target);
     crate::proc_ctl::command(program).args(&args).status().map_err(|e| e.to_string())?;
     Ok(())
@@ -24732,6 +24819,19 @@ pub fn run() {
             desktop_integration_status, desktop_integration_add, desktop_integration_remove, task_list_files_for_finder, task_match_ignored_files, task_send_diff_to_main,
             task_changes, task_git_status, task_git_branches, project_git_branches, project_branch_context, task_git_checkout, task_git_update, task_git_update_all, task_git_update_info, task_stage, task_unstage, task_commit, task_discard,
             task_git_log, task_git_refs, task_git_push, task_git_commit_files, task_git_compare, task_git_blame, task_git_commit_meta, task_git_commit_offset,
+            delivery::task_delivery_archive_ready,
+            delivery::task_delivery_results,
+            delivery::task_delivery_repos,
+            delivery::task_delivery_details,
+            delivery::task_delivery_validate,
+            delivery::task_delivery_log,
+            delivery::task_delivery_requests,
+            delivery::task_delivery_request,
+            delivery::task_delivery_request_status,
+            delivery::task_delivery_draft_save,
+            delivery::task_delivery_reply_post,
+            delivery::task_delivery_pr_create,
+            delivery::task_delivery_update,
             detect_forges, task_pr_status, task_member_pr_status, task_pr_create, task_pr_comments, task_set_pr_watch, task_set_pr_comments_seen,
             project_forge_issues, project_forge_provider, project_forge_prs, project_fetch_pr_branch, project_git_checkout,
             task_file_diff, task_file_diff_sides, task_file_read, file_read_external, clipboard_image_save, clipboard_image_capture, task_file_read_base64, task_file_fp, task_file_write, task_dir_list, task_path_stat,
@@ -30364,6 +30464,9 @@ mod tests {
         let member = tempdir().unwrap();
         let mut ws = task_with_member("api", host.path(), member.path());
         let push = |ws: &mut Task, dir_name: &str, path: String| ws.composition.push(TaskMember {
+            pr_url: None,
+            pr_number: None,
+            pr_provider: None,
             dir_name: dir_name.into(),
             mode: MemberMode::RepoRoot,
             path,
@@ -30402,7 +30505,7 @@ mod tests {
                     branch: "stale".into(),
                     ..Default::default()
                 },
-                // A member whose checkout vanished is skipped entirely.
+                // Missing checkouts must remain visible as delivery blockers.
                 TaskMember {
                     dir_name: "gone".into(),
                     mode: MemberMode::RepoRoot,
@@ -30412,7 +30515,8 @@ mod tests {
             ];
             crate::save_task(&ws).unwrap();
             let rows = member_pr_lookups("t1").unwrap();
-            assert_eq!(rows.len(), 1);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].lookup.status, "checkout-missing");
             assert_eq!(rows[0].dir_name, "api");
             assert_eq!(rows[0].branch, "feat-live");
             assert_eq!(rows[0].lookup.status, "no-remote");
