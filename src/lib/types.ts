@@ -1396,6 +1396,10 @@ export interface TerminalTab extends BaseTab {
     failed?: boolean;
   };
   ptyId?: string;
+  /** Set when the PTY spawn itself threw — the pane paints the error and
+   *  clears it on the next successful spawn. Lets async waiters (delivery
+   *  handoff) fail fast instead of polling a PTY that will never exist. */
+  spawnError?: string | null;
   /** Wall-clock timestamps used for the idle heuristic. */
   lastInputAt?: number | null;
   lastOutputAt?: number | null;
@@ -1980,12 +1984,18 @@ export interface DeliveryRequest {
   error: string | null;
   /** Display-only summary of what the request covers ("repo: lint, src/x.ts:12"). */
   scope: string;
+  /** Evidence item key → canonical JSON captured at prepare; re-verified at send. */
+  evidence: Record<string, string>;
+  /** Terminal tab the prompt was queued to / sent in — the card's jump target. */
+  agent?: string | null;
   drafts: DeliveryDraft[];
   prs: { dir_name: string; title: string; body: string }[];
 }
 export interface DeliveryResult {
   dir_name: string;
   name: string;
+  /** "pr" | "update"; absent on rows persisted before the tag existed. */
+  action?: string;
   url: string | null;
   result: UpdateResult | null;
   error: string | null;

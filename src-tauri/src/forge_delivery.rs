@@ -190,15 +190,27 @@ pub fn revision(provider: &str, cwd: &Path, number: u64) -> Result<String, Strin
 fn state(raw: &str) -> String {
     match raw.to_ascii_lowercase().as_str() {
         "success" | "succeeded" | "passed" | "approved" => "passed",
-        "failure" | "failed" | "timed_out" | "startup_failure" | "rejected" | "broken" => "failed",
+        // Azure build *results* that mean "finished, something needs a look"
+        // (partiallysucceeded / abandoned) land here lowercased too.
+        "failure"
+        | "failed"
+        | "timed_out"
+        | "startup_failure"
+        | "rejected"
+        | "broken"
+        | "partiallysucceeded"
+        | "succeededwithissues"
+        | "abandoned" => "failed",
         "cancelled" | "canceled" => "canceled",
         "skipped" | "neutral" | "notapplicable" => "skipped",
         "action_required" | "manual" | "waiting" => "approval",
-        "in_progress" | "running" => "running",
+        // Azure *statuses* land here lowercased: inProgress/cancelling/postponed.
+        "in_progress" | "inprogress" | "running" | "cancelling" | "postponed" => "running",
         "queued"
         | "pending"
         | "created"
         | "notstarted"
+        | "notset"
         | "preparing"
         | "scheduled"
         | "waiting_for_resource" => "pending",
@@ -947,6 +959,13 @@ mod tests {
         assert_eq!(state("ACTION_REQUIRED"), "approval");
         assert_eq!(state("notStarted"), "pending");
         assert_eq!(state("FAILURE"), "failed");
+        // Azure live statuses/results land lowercased — these used to fall
+        // through to "unknown" and render a running build as dead.
+        assert_eq!(state("inProgress"), "running");
+        assert_eq!(state("postponed"), "running");
+        assert_eq!(state("notSet"), "pending");
+        assert_eq!(state("partiallySucceeded"), "failed");
+        assert_eq!(state("abandoned"), "failed");
         assert_eq!(state("something-new"), "unknown");
         assert_eq!(aggregate(&["skipped"]), "skipped");
         assert_eq!(aggregate(&["passed", "canceled"]), "canceled");

@@ -245,22 +245,36 @@ actions to recorded selectors, canonical paths, branches, HEADs, remotes,
 working-tree fingerprints, and optional PR source revisions. All provider/Git
 work runs on `spawn_blocking`.
 
-`task_delivery_request { id, expected, drafts, kind }` stores a reviewed request;
-kind is `fix`, `replies`, `prs`, or `conflicts`. Agents write bounded JSON reports
-into the ignored task `.termic-delivery` directory. `task_delivery_requests`
-imports only requested thread keys/repositories; a malformed report records
-its error on that one request instead of failing the listing, and a corrected
-rewrite imports on the next read. Importing creates no PRs and posts no
-comments. `task_delivery_request_status` tracks handoff outcomes through a
-checked transition table: `prepared → queued/sent/failed/uncertain`,
+`task_delivery_request { id, expected, drafts, kind, scope, evidenceKeys }` stores
+a reviewed request; kind is `fix`, `replies`, `prs`, or `conflicts`. Evidence
+keys (`{dir}:ci:{id}` / `{dir}:review:{id}`) snapshot the selected items'
+canonical JSON on the request. `task_delivery_request_check` re-probes those
+items and fails the send when anything was edited or re-run since review;
+`task_delivery_request_amend` rewrites drafts/evidence/scope while a request
+is still `prepared` (the send dialog's item picker). Agents write bounded JSON
+reports into the ignored task `.termic-delivery` directory.
+`task_delivery_requests` imports only requested thread keys/repositories; a
+malformed report records its error on that one request instead of failing the
+listing, and a corrected rewrite imports on the next read. Reports must be
+JSON objects with `drafts`/`prs` as arrays when present; each list is fully
+validated before anything is applied, so a bad entry never leaves a partial
+import behind. Importing creates no PRs and posts no comments.
+`task_delivery_request_status` tracks handoff outcomes through a checked
+transition table: `prepared → queued/sent/failed/uncertain`,
 `queued|sent → sent/failed/uncertain`, `uncertain → sent/failed`,
-`failed → queued/sent`, same-status writes are no-ops, and `drafted` is
-terminal.
+`failed → queued/sent`, `drafted → failed` (explicit dismiss), same-status
+writes are no-ops. It returns the status it replaced; the send path marks
+the request `queued` before the evidence check and verifies that previous
+status equals the one it read, so `request_amend` can no longer swap drafts
+under a prompt about to be typed and a dismiss landing mid-claim wins.
+Its optional `agent` argument records the terminal tab the prompt went to —
+the request card's "Open agent" jump target.
 `task_delivery_draft_save` edits a local reply; `task_delivery_reply_post` posts
 one explicitly selected reply to its original thread. A stable hidden comment
 marker identifies uncertain posts during readback.
 
 `task_delivery_pr_create` and `task_delivery_update` process selected repositories
-sequentially and retain per-repository results across retries and restarts.
+sequentially and retain results per (repository, action) across retries and
+restarts — a repo can hold an update row and a PR row at once.
 `task_delivery_results` restores those results. `task_delivery_archive_ready`
 keeps tasks open when a repository is missing, dirty, unknown, or undelivered.

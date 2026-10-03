@@ -82,10 +82,15 @@ pub struct PrText {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub identities: Vec<Identity>,
+    #[serde(default)]
     pub report: String,
+    #[serde(default)]
     pub status: String,
+    #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
     pub kind: String,
@@ -94,11 +99,24 @@ pub struct Request {
     /// Display-only; evidence itself is embedded in the prompt text.
     #[serde(default)]
     pub scope: String,
+    /// Selected evidence item key → canonical JSON captured at request time.
+    /// Compared against a fresh provider probe before send so a comment
+    /// edited or a check re-run between review and send is caught instead
+    /// of silently handed to the agent.
+    #[serde(default)]
+    pub evidence: std::collections::HashMap<String, String>,
+    /// Terminal tab the prompt was queued to or sent in — lets the request
+    /// card jump straight to the working agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
     pub drafts: Vec<Draft>,
+    #[serde(default)]
     pub prs: Vec<PrText>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Saved {
+    #[serde(default)]
     requests: Vec<Request>,
     #[serde(default)]
     results: Vec<ActionResult>,
@@ -115,6 +133,11 @@ pub struct PrInput {
 pub struct ActionResult {
     pub dir_name: String,
     pub name: String,
+    /// "pr" | "update" — a repo can legitimately hold one row of each
+    /// (a conflicted update and a failed PR create); `store_results`
+    /// replaces only same-action rows for a directory.
+    #[serde(default)]
+    pub action: String,
     pub url: Option<String>,
     pub result: Option<UpdateResult>,
     pub error: Option<String>,
@@ -138,7 +161,10 @@ fn fingerprint(cwd: &Path) -> Result<String, String> {
     hash.update(
         status
             .lines()
-            .filter(|l| !(l.starts_with("?? ") && l[3..].starts_with(".termic-delivery")))
+            .filter(|l| {
+                !(l.starts_with("?? ")
+                    && (&l[3..] == ".termic-delivery" || l[3..].starts_with(".termic-delivery/")))
+            })
             .collect::<Vec<_>>()
             .join("\n"),
     );
@@ -147,7 +173,9 @@ fn fingerprint(cwd: &Path) -> Result<String, String> {
     for p in git(&["ls-files", "--others", "--exclude-standard", "-z"], cwd)
         .map_err(|e| e.to_string())?
         .split('\0')
-        .filter(|p| !p.is_empty() && !p.starts_with(".termic-delivery"))
+        .filter(|p| {
+            !p.is_empty() && *p != ".termic-delivery" && !p.starts_with(".termic-delivery/")
+        })
     {
         if let Ok(m) = fs::symlink_metadata(cwd.join(p)) {
             hash.update(m.len().to_le_bytes());
@@ -248,9 +276,16 @@ fn saved_path(id: &str) -> Result<PathBuf, String> {
 fn load(id: &str) -> Result<Saved, String> {
     let path = saved_path(id)?;
     match fs::read(&path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|e| format!("Cannot read delivery drafts: {e}"))
-        }
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(s) => Ok(s),
+            // A torn write or hand-edit would otherwise hard-error every
+            // delivery command forever — park the unreadable file next to
+            // the original and start with an empty store instead.
+            Err(_) => {
+                let _ = fs::rename(&path, path.with_extension("corrupt.json"));
+                Ok(Saved::default())
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Saved::default()),
         Err(e) => Err(e.to_string()),
     }
@@ -273,6 +308,11 @@ fn safe_report(w: &Task, r: &Request) -> Result<PathBuf, String> {
     }
     let parent =
         dunce::canonicalize(path.parent().ok_or("missing parent")?).map_err(|e| e.to_string())?;
+    // A regular file at .termic-delivery canonicalizes to itself and passes
+    // the path check — without this, every poll silently finds no report.
+    if !parent.is_dir() {
+        return Err(".termic-delivery is not a directory".into());
+    }
     if parent != root.join(".termic-delivery") {
         return Err("Report directory escapes the task".into());
     }
@@ -440,30 +480,42 @@ fn import_report(w: &Task, r: &mut Request) -> Result<Option<bool>, String> {
     let bytes = read_report(&path)?;
     let report = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|_| "Report is not valid JSON".to_string())?;
+    if !report.is_object() {
+        return Err("Report must be a JSON object".into());
+    }
     let mut mutated = false;
-    if let Some(list) = report["drafts"].as_array() {
+    // Validate BOTH lists fully before mutating anything: drafts only fill
+    // empty bodies, so a report that applied its first items then errored
+    // on a later one could never be repaired by a corrected rewrite.
+    let mut staged_drafts: Option<Vec<(&str, &str)>> = None;
+    if let Some(v) = report.get("drafts") {
+        let list = v.as_array().ok_or("Report drafts must be an array")?;
+        let mut seen = HashSet::new();
+        let mut staged = Vec::with_capacity(list.len());
         for item in list {
             let key = item["key"].as_str().ok_or("Draft report has no item key")?;
             let body = item["body"].as_str().ok_or("Draft report has no body")?;
             if body.len() > 32000 {
                 return Err("Draft reply exceeds 32,000 bytes".into());
             }
-            let d = r
-                .drafts
-                .iter_mut()
-                .find(|d| d.key == key)
-                .ok_or("Draft report contains an unrequested thread")?;
-            if d.status == "draft" && d.body.is_empty() {
-                d.body = body.into();
-                mutated = true;
+            if !seen.insert(key) {
+                return Err("Duplicate draft item".into());
             }
+            if !r.drafts.iter().any(|d| d.key == key) {
+                return Err("Draft report contains an unrequested thread".into());
+            }
+            staged.push((key, body));
         }
+        staged_drafts = Some(staged);
     }
-    if let Some(list) = report["prs"].as_array() {
+    let mut staged_prs: Option<Vec<PrText>> = None;
+    if let Some(v) = report.get("prs") {
+        let list = v.as_array().ok_or("Report prs must be an array")?;
         if !list.is_empty() && r.kind != "prs" {
             return Err("Unexpected PR drafts in report".into());
         }
         let mut seen = HashSet::new();
+        let mut staged = Vec::with_capacity(list.len());
         for item in list {
             let dir = item["dir_name"]
                 .as_str()
@@ -479,19 +531,46 @@ fn import_report(w: &Task, r: &mut Request) -> Result<Option<bool>, String> {
             if title.len() > 1000 || body.len() > 32000 {
                 return Err("PR draft is too large".into());
             }
-            r.prs.retain(|p| p.dir_name != dir);
-            r.prs.push(PrText {
+            staged.push(PrText {
                 dir_name: dir.into(),
                 title: title.into(),
                 body: body.into(),
             });
+        }
+        staged_prs = Some(staged);
+    }
+    // Both lists validated — apply.
+    if let Some(staged) = staged_drafts {
+        for (key, body) in staged {
+            let Some(d) = r.drafts.iter_mut().find(|d| d.key == key) else {
+                continue;
+            };
+            if d.status == "draft" && d.body.is_empty() {
+                d.body = body.into();
+                mutated = true;
+            }
+        }
+    }
+    if let Some(staged) = staged_prs {
+        for p in staged {
+            r.prs.retain(|x| x.dir_name != p.dir_name);
+            r.prs.push(p);
             mutated = true;
         }
     }
-    if r.kind == "prs" && r.prs.is_empty() {
+    // An explicit (even empty) "prs"/"drafts" list is a delivered report —
+    // the agent answered, it just had nothing to fill. A report lacking the
+    // key entirely is still "waiting".
+    if r.kind == "prs" && r.prs.is_empty() && report.get("prs").is_none() {
         return Ok(Some(mutated));
     }
-    if !r.drafts.is_empty() && r.drafts.iter().any(|d| d.body.is_empty()) {
+    // Only 'replies' requests make the drafts list mandatory — 'fix' drafts
+    // are opportunistic extras (the prompt asks for reply text where a
+    // thread was fixed, but the fix itself is the deliverable).
+    if r.kind == "replies"
+        && r.drafts.iter().any(|d| d.body.is_empty())
+        && report.get("drafts").is_none()
+    {
         return Ok(Some(mutated));
     }
     r.status = "drafted".into();
@@ -535,6 +614,113 @@ pub async fn task_delivery_requests(id: String) -> Result<Vec<Request>, String> 
     .await
     .map_err(|e| e.to_string())?
 }
+/// Split `${dir}:${ci|review}:${id}` — dir names may contain ':', so the
+/// repository is matched as the LONGEST prefix (dirs "a" and "a:b" listed
+/// together must resolve key "a:b:ci:x" to "a:b", not first-listed "a").
+fn parse_evidence_key<'a, 'b>(
+    expected: &'a [Identity],
+    key: &'b str,
+) -> Result<(&'a Identity, &'b str, &'b str), String> {
+    let i = expected
+        .iter()
+        .filter(|i| key.starts_with(&format!("{}:", i.dir_name)))
+        .max_by_key(|i| i.dir_name.len())
+        .ok_or("Evidence repository not selected")?;
+    let rest = &key[i.dir_name.len() + 1..];
+    let (which, item) = rest.split_once(':').ok_or("Malformed evidence key")?;
+    Ok((i, which, item))
+}
+
+/// Canonical JSON of one evidence item in a fresh probe — `None` when the
+/// id no longer exists (or `which` is neither "ci" nor "review").
+fn evidence_json(det: &Details, which: &str, item: &str) -> Option<String> {
+    match which {
+        "ci" => det
+            .ci
+            .iter()
+            .find(|n| n.id == item)
+            .and_then(|n| serde_json::to_string(n).ok()),
+        "review" => det
+            .threads
+            .iter()
+            .find(|t| t.id == item)
+            .and_then(|t| serde_json::to_string(t).ok()),
+        _ => None,
+    }
+}
+
+/// Serialize the selected evidence items (key → canonical JSON of the CI
+/// node or review thread). A fresh probe at send time compares against
+/// this snapshot — anything edited or re-run in between fails the send.
+fn collect_evidence(
+    id: &str,
+    expected: &[Identity],
+    evidence_keys: &[String],
+    cache: &mut HashMap<String, Details>,
+) -> Result<HashMap<String, String>, String> {
+    if evidence_keys.len() > 200 {
+        return Err("Select at most 200 evidence items".into());
+    }
+    let mut out = HashMap::new();
+    for key in evidence_keys {
+        let (i, which, item) = parse_evidence_key(expected, key)?;
+        if !cache.contains_key(&i.dir_name) {
+            cache.insert(i.dir_name.clone(), details(id, i.clone())?);
+        }
+        let det = &cache[&i.dir_name];
+        // A failed probe leaves its half empty — surface the real probe
+        // error rather than reporting every item as deleted.
+        let probe_error = match which {
+            "ci" => &det.ci_error,
+            "review" => &det.threads_error,
+            _ => &None,
+        };
+        if let Some(e) = probe_error {
+            return Err(e.clone());
+        }
+        let json = evidence_json(det, which, item)
+            .ok_or("Evidence item is gone. Refresh and select again.")?;
+        out.insert(key.clone(), json);
+    }
+    Ok(out)
+}
+
+/// Validate reply drafts against a live provider probe, populating the
+/// shared details cache for reuse by evidence collection.
+fn check_drafts(
+    id: &str,
+    expected: &[Identity],
+    drafts: &[Draft],
+    cache: &mut HashMap<String, Details>,
+) -> Result<(), String> {
+    let mut keys = HashSet::new();
+    for d in drafts {
+        if !keys.insert(&d.key) {
+            return Err("Duplicate draft item".into());
+        }
+        let i = expected
+            .iter()
+            .find(|i| i.dir_name == d.dir_name)
+            .ok_or("Draft repository not selected")?;
+        if !cache.contains_key(&d.dir_name) {
+            cache.insert(d.dir_name.clone(), details(id, i.clone())?);
+        }
+        let det = &cache[&d.dir_name];
+        if let Some(e) = &det.threads_error {
+            return Err(e.clone());
+        }
+        if det.pr.number != d.pr_number
+            || !det
+                .threads
+                .iter()
+                .any(|t| t.id == d.thread_id && t.reply_id == d.reply_id)
+        {
+            return Err("Review thread changed. Refresh.".into());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn task_delivery_request(
     id: String,
@@ -542,6 +728,7 @@ pub async fn task_delivery_request(
     drafts: Vec<Draft>,
     kind: String,
     scope: Option<String>,
+    evidence_keys: Vec<String>,
 ) -> Result<Request, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = LOCK.lock();
@@ -561,29 +748,9 @@ pub async fn task_delivery_request(
         for i in &expected {
             validate(&id, i)?;
         }
-        let mut keys = HashSet::new();
         let mut details_cache = HashMap::new();
-        for d in &drafts {
-            if !keys.insert(&d.key) {
-                return Err("Duplicate draft item".into());
-            }
-            let i = expected
-                .iter()
-                .find(|i| i.dir_name == d.dir_name)
-                .ok_or("Draft repository not selected")?;
-            if !details_cache.contains_key(&d.dir_name) {
-                details_cache.insert(d.dir_name.clone(), details(&id, i.clone())?);
-            }
-            let det = &details_cache[&d.dir_name];
-            if det.pr.number != d.pr_number
-                || !det
-                    .threads
-                    .iter()
-                    .any(|t| t.id == d.thread_id && t.reply_id == d.reply_id)
-            {
-                return Err("Review thread changed. Refresh.".into());
-            }
-        }
+        check_drafts(&id, &expected, &drafts, &mut details_cache)?;
+        let evidence = collect_evidence(&id, &expected, &evidence_keys, &mut details_cache)?;
         let root = dunce::canonicalize(&w.path).map_err(|e| e.to_string())?;
         let dir = root.join(".termic-delivery");
         if let Ok(m) = fs::symlink_metadata(&dir) {
@@ -628,6 +795,7 @@ pub async fn task_delivery_request(
             // Display-only label; cap so a hostile selection can't bloat the
             // durable file.
             scope: scope.unwrap_or_default().chars().take(500).collect(),
+            evidence,
             drafts: drafts
                 .into_iter()
                 .map(|mut d| {
@@ -638,22 +806,162 @@ pub async fn task_delivery_request(
                 })
                 .collect(),
             prs: vec![],
+            agent: None,
         };
         let mut data = load(&id)?;
         data.requests.push(r.clone());
+        // Bound the durable log — evidence snapshots embed thread bodies,
+        // so the file grows with every send otherwise. Requests append in
+        // order, so this drops the oldest finished ones past the cap;
+        // active requests are never pruned.
+        if data.requests.len() > 200 {
+            let mut excess = data.requests.len() - 200;
+            data.requests.retain(|r| {
+                if excess > 0 && matches!(r.status.as_str(), "drafted" | "failed") {
+                    excess -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         save(&id, &data)?;
         Ok(r)
     })
     .await
     .map_err(|e| e.to_string())?
 }
+/// Re-probe the request's evidence items and prove they are unchanged since
+/// the user reviewed them — a thread edited or a check re-run in between
+/// means the prompt no longer matches what was approved.
+#[tauri::command]
+pub async fn task_delivery_request_check(id: String, request_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // load() may rename a corrupt file — that write needs the mutation
+        // lock so a concurrent save can't be moved aside underneath it.
+        // The provider probe itself stays lock-free: a wedged mutating
+        // command elsewhere must not stall send checks.
+        task(&id)?;
+        let data = {
+            let _guard = LOCK.lock();
+            load(&id)?
+        };
+        let r = data
+            .requests
+            .iter()
+            .find(|r| r.id == request_id)
+            .ok_or("Request is gone")?;
+        if r.evidence.is_empty() {
+            return Ok(());
+        }
+        let mut cache = HashMap::new();
+        for (key, expected_json) in &r.evidence {
+            let (i, which, item) = parse_evidence_key(&r.identities, key)?;
+            if !cache.contains_key(&i.dir_name) {
+                cache.insert(i.dir_name.clone(), details(&id, i.clone())?);
+            }
+            let det = &cache[&i.dir_name];
+            // A probe outage empties its half of the detail — surface the
+            // real error, not "item gone".
+            let probe_error = match which {
+                "ci" => &det.ci_error,
+                "review" => &det.threads_error,
+                _ => &None,
+            };
+            if let Some(e) = probe_error {
+                return Err(e.clone());
+            }
+            let fresh = evidence_json(det, which, item).ok_or_else(|| {
+                format!("Evidence item is gone ({}). Refresh and send again.", key)
+            })?;
+            if &fresh != expected_json {
+                return Err("Evidence changed since review. Refresh and send again.".into());
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+/// Rewrite a still-prepared request's drafts/evidence/scope — the send
+/// dialog's item picker adjusts coverage before dispatch. Anything beyond
+/// `prepared` is immutable: a queued or sent prompt must match its request.
+#[tauri::command]
+pub async fn task_delivery_request_amend(
+    id: String,
+    request_id: String,
+    drafts: Vec<Draft>,
+    evidence_keys: Vec<String>,
+    scope: Option<String>,
+) -> Result<Request, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = LOCK.lock();
+        task(&id)?;
+        let mut data = load(&id)?;
+        let idx = data
+            .requests
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or("Request is gone")?;
+        if data.requests[idx].status != "prepared" {
+            return Err("Request already left the dialog".into());
+        }
+        if drafts.len() > 100 {
+            return Err("Select at most 100 threads".into());
+        }
+        let expected = data.requests[idx].identities.clone();
+        let mut details_cache = HashMap::new();
+        check_drafts(&id, &expected, &drafts, &mut details_cache)?;
+        let mut evidence = collect_evidence(&id, &expected, &evidence_keys, &mut details_cache)?;
+        let r = &mut data.requests[idx];
+        // Keys the user already reviewed keep their original snapshot — the
+        // send-time check must compare against what was approved, not a
+        // silently re-baselined probe. Only items newly added in the picker
+        // take a fresh snapshot.
+        for (k, v) in &mut evidence {
+            if let Some(old) = r.evidence.get(k) {
+                *v = old.clone();
+            }
+        }
+        r.evidence = evidence;
+        // Rotating the id retires stale queue copies pinned to the
+        // pre-amend prompt: they fail the send-time claim with "Request is
+        // gone" instead of typing the old text.
+        let new_id = Uuid::new_v4().to_string();
+        r.report = Path::new(&r.report)
+            .with_file_name(format!("{new_id}.json"))
+            .to_string_lossy()
+            .into_owned();
+        r.id = new_id;
+        r.drafts = drafts
+            .into_iter()
+            .map(|mut d| {
+                d.body.clear();
+                d.status = "draft".into();
+                d.error = None;
+                d
+            })
+            .collect();
+        r.scope = scope.unwrap_or_default().chars().take(500).collect();
+        let out = r.clone();
+        save(&id, &data)?;
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+/// Returns the status the request was in before this call, so a sender can
+/// tell "I claimed it from the state I read" apart from "a dismiss or a
+/// parallel send landed in between" (both read as a successful mark
+/// otherwise, since loose transitions allow e.g. failed → queued).
 #[tauri::command]
 pub async fn task_delivery_request_status(
     id: String,
     request_id: String,
     status: String,
     error: Option<String>,
-) -> Result<(), String> {
+    agent: Option<String>,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = LOCK.lock();
         if !["queued", "sent", "failed", "uncertain"].contains(&status.as_str()) {
@@ -667,7 +975,8 @@ pub async fn task_delivery_request_status(
             .ok_or("Unknown delivery request")?;
         // Loose transitions let a stale queue item re-"send" a request that
         // was already sent (the prompt would be typed twice). Same-status is
-        // an idempotent no-op; 'drafted' is terminal.
+        // an idempotent no-op; 'drafted' is terminal except for the user's
+        // explicit dismiss (failed-with-no-error is the hidden state).
         let legal = r.status == status
             || matches!(
                 (r.status.as_str(), status.as_str()),
@@ -676,6 +985,7 @@ pub async fn task_delivery_request_status(
                     | ("sent", "failed" | "uncertain")
                     | ("uncertain", "sent" | "failed")
                     | ("failed", "queued" | "sent")
+                    | ("drafted", "failed")
             );
         if !legal {
             return Err(format!(
@@ -683,9 +993,19 @@ pub async fn task_delivery_request_status(
                 r.status
             ));
         }
+        let prev = r.status.clone();
+        let same = prev == status;
         r.status = status;
-        r.error = error;
-        save(&id, &data)
+        // A same-status mark is a no-op re-mark (queue drain); don't let
+        // its null error wipe a recorded import/send error.
+        if !(same && error.is_none()) {
+            r.error = error;
+        }
+        if let Some(tab) = agent {
+            r.agent = Some(tab);
+        }
+        save(&id, &data)?;
+        Ok(prev)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -813,10 +1133,12 @@ pub async fn task_delivery_pr_create(
         let mut seen = HashSet::new();
         for input in inputs {
             let dir = input.identity.dir_name.clone();
-            if !seen.insert(dir.clone()) {
-                return Err("Duplicate repository selection".into());
-            }
+            // Per-item outcome, like update(): a dup mid-list must not drop
+            // the results for repos already pushed/created.
             let outcome = (|| {
+                if !seen.insert(dir.clone()) {
+                    return Err("Duplicate repository selection".into());
+                }
                 let (w, cwd) = validate(&id, &input.identity)?;
                 let l = lookup(&w, &cwd, &dir);
                 if l.status != "ok" {
@@ -886,6 +1208,7 @@ pub async fn task_delivery_pr_create(
             results.push(ActionResult {
                 dir_name: dir.clone(),
                 name: if dir.is_empty() { "Host".into() } else { dir },
+                action: "pr".into(),
                 url: outcome.as_ref().ok().cloned(),
                 result: None,
                 error: outcome.err(),
@@ -923,6 +1246,7 @@ pub async fn task_delivery_update(
                 ActionResult {
                     dir_name: dir.clone(),
                     name: if dir.is_empty() { "Host".into() } else { dir },
+                    action: "update".into(),
                     url: None,
                     error: outcome.as_ref().err().cloned(),
                     result: outcome.ok(),
@@ -1003,7 +1327,13 @@ pub async fn task_delivery_archive_ready(id: String) -> Result<bool, String> {
 fn store_results(id: &str, results: Vec<ActionResult>) -> Result<Vec<ActionResult>, String> {
     let mut data = load(id)?;
     for result in results {
-        data.results.retain(|r| r.dir_name != result.dir_name);
+        // One row per (dir, action): a pr_create row must not erase a
+        // still-conflicted update row for the same repo, or the conflicts
+        // handoff loses its evidence. Legacy rows carry no action and are
+        // replaced by the next write for their dir.
+        data.results.retain(|r| {
+            !(r.dir_name == result.dir_name && (r.action == result.action || r.action.is_empty()))
+        });
         data.results.push(result);
     }
     save(id, &data)?;
@@ -1040,6 +1370,7 @@ mod persistence_tests {
                 vec![],
                 "prs".into(),
                 Some("app".into()),
+                vec![],
             ))
             .unwrap();
             assert_eq!(
@@ -1051,6 +1382,7 @@ mod persistence_tests {
                 w.id.clone(),
                 request.id.clone(),
                 "sent".into(),
+                None,
                 None,
             ))
             .unwrap();
@@ -1085,6 +1417,7 @@ mod persistence_tests {
                 vec![ActionResult {
                     dir_name: "".into(),
                     name: "Host".into(),
+                    action: "pr".into(),
                     url: Some("https://example.test/pull/7".into()),
                     result: None,
                     error: None,
@@ -1096,6 +1429,7 @@ mod persistence_tests {
                 vec![ActionResult {
                     dir_name: "api".into(),
                     name: "api".into(),
+                    action: "update".into(),
                     url: None,
                     result: None,
                     error: Some("offline".into()),
@@ -1136,6 +1470,7 @@ mod persistence_tests {
                 vec![],
                 "prs".into(),
                 None,
+                vec![],
             ))
             .unwrap();
             let set = |to: &str| {
@@ -1144,6 +1479,7 @@ mod persistence_tests {
                     request.id.clone(),
                     to.into(),
                     None,
+                    None,
                 ))
             };
             set("queued").unwrap();
@@ -1151,11 +1487,98 @@ mod persistence_tests {
             set("sent").unwrap();
             assert!(set("queued").is_err(), "a sent request cannot re-queue");
             assert!(set("sent").is_ok());
-            // 'drafted' (the report-imported end state) is terminal.
+            // 'drafted' (the report-imported end state) is terminal except
+            // for the user's explicit dismiss, which lands on 'failed'.
             let mut data = load(&w.id).unwrap();
             data.requests[0].status = "drafted".into();
             save(&w.id, &data).unwrap();
-            assert!(set("failed").is_err());
+            assert!(set("sent").is_err());
+            assert!(set("failed").is_ok(), "dismiss from drafted");
+        });
+    }
+
+    #[test]
+    fn amend_rewrites_only_prepared_requests() {
+        with_scratch_data_dir(|_| {
+            let checkout = tempfile::tempdir().unwrap();
+            let root = checkout.path();
+            git(&["init", "-b", "main"], root).unwrap();
+            git(&["config", "user.email", "fixture@example.test"], root).unwrap();
+            git(&["config", "user.name", "Fixture"], root).unwrap();
+            fs::write(root.join("README.md"), "fixture").unwrap();
+            git(&["add", "README.md"], root).unwrap();
+            git(&["commit", "-m", "fixture"], root).unwrap();
+            let w = Task {
+                id: Uuid::new_v4().to_string(),
+                name: "Fixture".into(),
+                path: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            };
+            save_task(&w).unwrap();
+            let request = tauri::async_runtime::block_on(task_delivery_request(
+                w.id.clone(),
+                vec![identity(&w, "").unwrap()],
+                vec![],
+                "prs".into(),
+                Some("old".into()),
+                vec![],
+            ))
+            .unwrap();
+            let amended = tauri::async_runtime::block_on(task_delivery_request_amend(
+                w.id.clone(),
+                request.id.clone(),
+                vec![],
+                vec![],
+                Some("repo · branch".into()),
+            ))
+            .unwrap();
+            assert_eq!(amended.scope, "repo · branch");
+            assert!(amended.evidence.is_empty());
+            // Amend rotates the id: a queue item or sender still holding the
+            // old id must fail instead of typing the pre-amend prompt.
+            assert_ne!(amended.id, request.id);
+            assert!(
+                tauri::async_runtime::block_on(task_delivery_request_status(
+                    w.id.clone(),
+                    request.id.clone(),
+                    "failed".into(),
+                    None,
+                    None,
+                ))
+                .is_err(),
+                "the replaced request id is gone"
+            );
+            tauri::async_runtime::block_on(task_delivery_request_status(
+                w.id.clone(),
+                amended.id.clone(),
+                "sent".into(),
+                None,
+                None,
+            ))
+            .unwrap();
+            assert!(
+                tauri::async_runtime::block_on(task_delivery_request_amend(
+                    w.id.clone(),
+                    amended.id.clone(),
+                    vec![],
+                    vec![],
+                    Some("too late".into()),
+                ))
+                .is_err(),
+                "a sent request's evidence is immutable"
+            );
+            assert_eq!(load(&w.id).unwrap().requests[0].scope, "repo · branch");
+            // Empty evidence snapshots always pass the send-time check.
+            tauri::async_runtime::block_on(task_delivery_request_check(
+                w.id.clone(),
+                amended.id.clone(),
+            ))
+            .unwrap();
+            assert!(tauri::async_runtime::block_on(task_delivery_request_check(
+                w.id.clone(),
+                "missing".into(),
+            ))
+            .is_err());
         });
     }
 
@@ -1191,9 +1614,15 @@ mod persistence_tests {
             drafts: vec![draft("a", ""), draft("b", "local edit")],
             prs: vec![],
             scope: String::new(),
+            evidence: HashMap::new(),
+            agent: None,
         };
         // A replies report cannot smuggle PR drafts past the request kind.
-        fs::write(dir.join("r1.json"), r#"{"prs":[{"dir_name":"","title":"t","body":"b"}]}"#).unwrap();
+        fs::write(
+            dir.join("r1.json"),
+            r#"{"prs":[{"dir_name":"","title":"t","body":"b"}]}"#,
+        )
+        .unwrap();
         assert_eq!(
             import_report(&w, &mut r).unwrap_err(),
             "Unexpected PR drafts in report"
@@ -1209,6 +1638,175 @@ mod persistence_tests {
         assert_eq!(r.drafts[0].body, "from agent");
         assert_eq!(r.drafts[1].body, "local edit");
         assert_eq!(r.status, "drafted");
+    }
+
+    #[test]
+    fn import_report_validates_shape_and_applies_atomically() {
+        let checkout = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(checkout.path()).unwrap();
+        let w = Task {
+            path: root.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let dir = root.join(".termic-delivery");
+        fs::create_dir_all(&dir).unwrap();
+        let draft = |key: &str| Draft {
+            key: key.into(),
+            dir_name: String::new(),
+            pr_number: 1,
+            thread_id: "t".into(),
+            reply_id: "x".into(),
+            body: String::new(),
+            status: "draft".into(),
+            error: None,
+        };
+        let request = |kind: &str, drafts: Vec<Draft>| Request {
+            id: "r1".into(),
+            identities: vec![],
+            report: dir.join("r1.json").to_string_lossy().into_owned(),
+            status: "sent".into(),
+            error: None,
+            kind: kind.into(),
+            drafts,
+            prs: vec![],
+            scope: String::new(),
+            evidence: HashMap::new(),
+            agent: None,
+        };
+        // Non-object and non-array payloads are errors, not silent no-ops
+        // (a bare `"ok"` used to count as a delivered report and wedge the
+        // request at 'drafted' with nothing inside).
+        let mut r = request("replies", vec![draft("a"), draft("b")]);
+        fs::write(&r.report, r#""ok""#).unwrap();
+        assert_eq!(
+            import_report(&w, &mut r).unwrap_err(),
+            "Report must be a JSON object"
+        );
+        assert_eq!(r.status, "sent");
+        fs::write(&r.report, r#"{"drafts":{"a":1}}"#).unwrap();
+        assert!(import_report(&w, &mut r).unwrap_err().contains("array"));
+        fs::write(&r.report, r#"{"prs":"done"}"#).unwrap();
+        assert!(import_report(&w, &mut r).unwrap_err().contains("array"));
+        // A bad second item must not leave the first applied — the report
+        // validates fully before any draft is filled, so a corrected
+        // rewrite can still land (drafts only fill empty bodies).
+        fs::write(
+            &r.report,
+            r#"{"drafts":[{"key":"a","body":"hi"},{"key":"bogus","body":"x"}]}"#,
+        )
+        .unwrap();
+        assert!(import_report(&w, &mut r).is_err());
+        assert!(r.drafts[0].body.is_empty(), "partial apply must not stick");
+        fs::write(
+            &r.report,
+            r#"{"drafts":[{"key":"a","body":"hi"},{"key":"b","body":"yo"}]}"#,
+        )
+        .unwrap();
+        import_report(&w, &mut r).unwrap();
+        assert_eq!(r.drafts[1].body, "yo");
+        assert_eq!(r.status, "drafted");
+        // An explicit empty list is a delivered report — the agent answered
+        // with nothing to fill; only a MISSING key still means "waiting".
+        let mut pr_req = request("prs", vec![]);
+        fs::write(&pr_req.report, r#"{"prs":[]}"#).unwrap();
+        import_report(&w, &mut pr_req).unwrap();
+        assert_eq!(pr_req.status, "drafted");
+        let mut reply_req = request("replies", vec![draft("a")]);
+        fs::write(&reply_req.report, r#"{"drafts":[]}"#).unwrap();
+        import_report(&w, &mut reply_req).unwrap();
+        assert_eq!(reply_req.status, "drafted");
+        // Drafts are mandatory only for 'replies': fix/conflicts drafts are
+        // optional agent extras — a report answering without one still
+        // completes, while a replies report missing the key keeps waiting.
+        let mut fix_req = request("fix", vec![draft("a")]);
+        // A NON-empty "prs" list doesn't belong on a fix request at all.
+        fs::write(
+            &fix_req.report,
+            r#"{"prs":[{"dir_name":"","title":"x","body":"y"}]}"#,
+        )
+        .unwrap();
+        import_report(&w, &mut fix_req).unwrap_err();
+        fs::write(
+            &fix_req.report,
+            r#"{"drafts":[{"key":"a","body":"fixed it"}]}"#,
+        )
+        .unwrap();
+        import_report(&w, &mut fix_req).unwrap();
+        assert_eq!(fix_req.drafts[0].body, "fixed it");
+        assert_eq!(fix_req.status, "drafted");
+        let mut fix_req2 = request("fix", vec![draft("a")]);
+        fs::write(&fix_req2.report, r#"{"extra":true}"#).unwrap();
+        import_report(&w, &mut fix_req2).unwrap();
+        assert_eq!(
+            fix_req2.status, "drafted",
+            "fix completes on any object report"
+        );
+        let mut wait_req = request("replies", vec![draft("a")]);
+        fs::write(&wait_req.report, r#"{"prs":[]}"#).unwrap();
+        import_report(&w, &mut wait_req).unwrap();
+        assert_eq!(
+            wait_req.status, "sent",
+            "replies still waits for its drafts key"
+        );
+    }
+
+    #[test]
+    fn results_are_stored_per_repo_and_action() {
+        with_scratch_data_dir(|_| {
+            let tmp = tempfile::tempdir().unwrap();
+            let w = Task {
+                id: Uuid::new_v4().to_string(),
+                name: "Fixture".into(),
+                path: tmp.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            };
+            save_task(&w).unwrap();
+            let row = |action: &str, error: Option<&str>| ActionResult {
+                dir_name: "api".into(),
+                name: "api".into(),
+                action: action.into(),
+                url: None,
+                result: None,
+                error: error.map(str::to_string),
+            };
+            // A conflicted-update row and a failed pr_create row for the
+            // same repo used to overwrite each other — both must survive.
+            store_results(&w.id, vec![row("update", Some("conflict"))]).unwrap();
+            store_results(&w.id, vec![row("pr", Some("offline"))]).unwrap();
+            let kept = load(&w.id).unwrap().results;
+            assert_eq!(kept.len(), 2, "pr and update results coexist per repo");
+            // The same action still replaces its previous row.
+            store_results(&w.id, vec![row("pr", Some("retry failed"))]).unwrap();
+            let kept = load(&w.id).unwrap().results;
+            assert_eq!(kept.len(), 2);
+            assert_eq!(kept[1].error.as_deref(), Some("retry failed"));
+        });
+    }
+
+    #[test]
+    fn evidence_keys_resolve_the_longest_dir_prefix() {
+        let id = |dir_name: &str| Identity {
+            dir_name: dir_name.into(),
+            path: String::new(),
+            branch: String::new(),
+            head: String::new(),
+            remote: String::new(),
+            worktree: String::new(),
+            pr_number: None,
+            pr_revision: None,
+        };
+        let ids = vec![id("a"), id("a:b"), id("")];
+        // ':' is a legal dir char on unix — "a:b:ci:x" must resolve to dir
+        // "a:b", not the first-listed "a" (which would split which="b").
+        let (i, which, item) = parse_evidence_key(&ids, "a:b:ci:build").unwrap();
+        assert_eq!(i.dir_name, "a:b");
+        assert_eq!((which, item), ("ci", "build"));
+        // The host repo's empty dir still resolves, and only for its own
+        // prefix.
+        let (i, which, item) = parse_evidence_key(&ids, ":review:t1").unwrap();
+        assert_eq!(i.dir_name, "");
+        assert_eq!((which, item), ("review", "t1"));
+        assert!(parse_evidence_key(&ids, "nope:ci:x").is_err());
     }
 }
 

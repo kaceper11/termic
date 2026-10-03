@@ -2875,7 +2875,7 @@ const captureArmedRef = useRef(false);
         firstOutputPatchedRef.current = false;
         patchTab(task.id, tab.id, {
           ptyId, lastOutputAt: Date.now(), firstOutputAt: null,
-          liveAccount: spawn.account ?? null,
+          liveAccount: spawn.account ?? null, spawnError: null,
         });
         // Per-PTY debug logger — active only when localStorage.ptyDebug === "1".
         // Writes to termic-pty-<task>-<cli>-<ptyId>.log in OS temp dir.
@@ -3351,6 +3351,7 @@ const captureArmedRef = useRef(false);
         setTimeout(refit, 600);
       } catch (e) {
         term.write(`\x1b[1;31mspawn failed: ${String(e)}\x1b[0m\r\n`);
+        patchTab(task.id, tab.id, { spawnError: String(e) });
       }
     })();
 

@@ -2624,6 +2624,48 @@ fn guarded_push(repo: &Path, args: &[&str]) -> std::result::Result<(), String> {
     guarded_git(repo, args, "push", 120)
 }
 
+/// Strip `user:PAT@` userinfo from URLs inside arbitrary text. Git error
+/// output echoes the remote URL (`fatal: unable to access
+/// 'https://PAT@dev.azure.com/...'`) and it lands in persisted results and
+/// toasts — `remote_for_display` covers a bare URL, this covers URLs
+/// embedded in a sentence. Only the authority segment's last `@` is
+/// userinfo; an `@` in the path stays.
+fn scrub_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        out.push_str(&rest[..pos + 3]);
+        let tail = &rest[pos + 3..];
+        let end = tail
+            .find(|c: char| matches!(c, '/' | ' ' | '\t' | '\r' | '\n' | '\'' | '"'))
+            .unwrap_or(tail.len());
+        let (authority, tail) = tail.split_at(end);
+        out.push_str(authority.rsplit('@').next().unwrap_or(authority));
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    #[test]
+    fn userinfo_is_stripped_but_path_at_signs_stay() {
+        assert_eq!(
+            super::scrub_url_userinfo(
+                "fatal: unable to access 'https://user:pat123@dev.azure.com/org/proj@x/_git/r/': The requested URL returned error: 403"
+            ),
+            "fatal: unable to access 'https://dev.azure.com/org/proj@x/_git/r/': The requested URL returned error: 403"
+        );
+        // No userinfo → unchanged; non-URL text untouched.
+        assert_eq!(
+            super::scrub_url_userinfo("fatal: unable to access 'https://github.com/o/r.git/'"),
+            "fatal: unable to access 'https://github.com/o/r.git/'"
+        );
+        assert_eq!(super::scrub_url_userinfo("ssh: connect to host"), "ssh: connect to host");
+    }
+}
+
 fn guarded_git(
     repo: &Path,
     args: &[&str],
@@ -2662,7 +2704,11 @@ fn guarded_git(
         })
     });
     let collect_err = |h: Option<thread::JoinHandle<String>>| -> String {
-        h.and_then(|h| h.join().ok()).unwrap_or_default().trim().to_string()
+        h.and_then(|h| h.join().ok())
+            .map(|s| scrub_url_userinfo(&s))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     };
 
     // Poll to a hard deadline; SIGKILL on expiry. ConnectTimeout=10 already
@@ -2685,12 +2731,14 @@ fn guarded_git(
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let err = collect_err(stderr_reader);
-                    return Err(if err.is_empty() {
-                        format!("{desc} timed out")
-                    } else {
-                        format!("{desc} timed out: {err}")
-                    });
+                    // Do NOT join the reader: a grandchild that inherited
+                    // the pipe (ssh, credential helper) keeps it open after
+                    // the kill, so read_to_string never ends and the
+                    // deadline would hang forever while holding the
+                    // delivery lock. The detached thread exits once the
+                    // fd closes.
+                    drop(stderr_reader);
+                    return Err(format!("{desc} timed out"));
                 }
                 thread::sleep(Duration::from_millis(100));
             }
@@ -24827,6 +24875,8 @@ pub fn run() {
             delivery::task_delivery_log,
             delivery::task_delivery_requests,
             delivery::task_delivery_request,
+            delivery::task_delivery_request_check,
+            delivery::task_delivery_request_amend,
             delivery::task_delivery_request_status,
             delivery::task_delivery_draft_save,
             delivery::task_delivery_reply_post,

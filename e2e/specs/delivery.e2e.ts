@@ -25,13 +25,11 @@ describe("task delivery", () => {
     await requireTermicApi();
     taskId = await createWorktreeTask("e2e-delivery", "e2e-delivery");
     await openRightTab("Delivery");
-    await waitForText("Select repositories");
     await browser.waitUntil(() => browser.execute(() => document.querySelector('[data-testid="delivery-repo"]')?.textContent?.includes("Clean")));
-    await clickWhenVisible('[data-testid="delivery-repo"] input[type="checkbox"]');
     await openActions();
     await clickMenuItem("Update branches");
     await browser.execute(() => { const select = document.querySelector<HTMLSelectElement>('[role="dialog"] select')!; select.value = "pull"; select.dispatchEvent(new Event("change", { bubbles: true })); });
-    await clickByText("Update selected branches");
+    await clickByText("Update branches");
     await browser.waitUntil(() => browser.execute(() => document.querySelector('[data-testid="delivery-results"]')?.textContent?.toLowerCase().includes("upstream")));
     await openRightTab("All files");
     await openRightTab("Delivery");
@@ -40,8 +38,6 @@ describe("task delivery", () => {
 
   it("reviews exact scope and rejects a changed worktree before sending", async () => {
     await waitForAgentReady(taskId);
-    // Panel selection is local and was intentionally reset by leaving it.
-    await clickWhenVisible('[data-testid="delivery-repo"] input[type="checkbox"]');
     await openActions();
     await clickMenuItem("Create PRs");
     await clickByText("Draft all with agent");

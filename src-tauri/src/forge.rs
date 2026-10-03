@@ -298,8 +298,13 @@ fn run(bin: &str, args: &[&str], cwd: Option<&Path>) -> std::io::Result<CmdOut> 
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = join(stdout);
-                    let _ = join(stderr);
+                    // Do NOT join the readers: a grandchild that inherited
+                    // the pipes (credential helper, pager, daemon) keeps
+                    // them open after the kill, so read_to_end never ends
+                    // and the "deadline" would hang forever. The detached
+                    // threads exit on their own once the fds close.
+                    drop(stdout);
+                    drop(stderr);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("{bin} did not exit within 120s"),
@@ -667,7 +672,11 @@ pub enum ForgeError {
 }
 
 fn stderr_of(o: &CmdOut) -> String {
-    String::from_utf8_lossy(&o.stderr).trim().to_string()
+    // CLI stderr can echo a PAT-bearing remote URL; strip userinfo before
+    // it reaches persisted errors or toasts.
+    crate::scrub_url_userinfo(&String::from_utf8_lossy(&o.stderr))
+        .trim()
+        .to_string()
 }
 
 /// Classify a failed CLI invocation: auth problems get their own arm so
